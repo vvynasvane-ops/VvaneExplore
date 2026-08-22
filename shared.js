@@ -11,7 +11,7 @@
    IndexedDB — shared store across every page
    --------------------------------------------------------------------- */
 const DB_NAME = "vvynas-vane-db";
-const DB_VERSION = 3;
+const DB_VERSION = 5;
 let dbPromise = null;
 function openDB() {
   if (dbPromise) return dbPromise;
@@ -25,6 +25,17 @@ function openDB() {
       if (!db.objectStoreNames.contains("playCounts")) db.createObjectStore("playCounts");
       if (!db.objectStoreNames.contains("monthStats")) db.createObjectStore("monthStats");
       if (!db.objectStoreNames.contains("djPlayCounts")) db.createObjectStore("djPlayCounts");
+      // Per-song custom album art (Settings-free — set from the full
+      // player's edit-art button). Key: song id. Value: a resized JPEG
+      // data URL produced by resizeImageFileToDataUrl below.
+      if (!db.objectStoreNames.contains("customArt")) db.createObjectStore("customArt");
+      // Per-song embedded album art — extracted straight out of the audio
+      // file's own tag (ID3v2 APIC, FLAC PICTURE block, or MP4 covr atom)
+      // the first time that file's metadata is read. This is the song's
+      // *own* cover, so it's the default shown any time there's no
+      // user-uploaded custom photo. Key: song id. Value: resized JPEG
+      // data URL, same normalized shape as customArt.
+      if (!db.objectStoreNames.contains("embeddedArt")) db.createObjectStore("embeddedArt");
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -51,9 +62,268 @@ async function idbGetAllKeys(store) {
   const db = await openDB();
   return new Promise((res, rej) => { const tx = db.transaction(store, "readonly"); const r = tx.objectStore(store).getAllKeys(); r.onsuccess = () => res(r.result || []); r.onerror = () => rej(r.error); });
 }
+async function idbGetAllEntries(store) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(store, "readonly");
+    const objStore = tx.objectStore(store);
+    const out = [];
+    const req = objStore.openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (cur) { out.push([cur.key, cur.value]); cur.continue(); } else res(out);
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
 async function idbPut(store, obj) {
   const db = await openDB();
   return new Promise((res, rej) => { const tx = db.transaction(store, "readwrite"); tx.objectStore(store).put(obj); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); });
+}
+
+/* ---------------------------------------------------------------------
+   Custom album art — takes a photo picked from device storage, at
+   *any* resolution or aspect ratio, and normalizes it into a fixed
+   512x512 JPEG data URL. Center-crops to a square first (like CSS
+   object-fit: cover) so nothing gets stretched or letterboxed, then
+   downscales, so the result is a consistent size/format that drops
+   into every art call site — library rows, mini-player, full player,
+   lock-screen artwork — exactly like generatedArt()'s output does.
+   --------------------------------------------------------------------- */
+async function loadImageBitmapFromFile(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file); } catch { /* fall through to <img> path below */ }
+  }
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = (err) => { URL.revokeObjectURL(url); reject(err); };
+    img.src = url;
+  });
+}
+async function resizeImageFileToDataUrl(file, size = 512, quality = 0.86) {
+  const bitmap = await loadImageBitmapFromFile(file);
+  try {
+    const srcW = bitmap.width, srcH = bitmap.height;
+    const cropSize = Math.min(srcW, srcH);
+    const sx = (srcW - cropSize) / 2, sy = (srcH - cropSize) / 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, sx, sy, cropSize, cropSize, 0, 0, size, size);
+    return canvas.toDataURL("image/jpeg", quality);
+  } finally {
+    if (bitmap.close) bitmap.close(); // only ImageBitmap has this, not the <img> fallback
+  }
+}
+
+/* ---------------------------------------------------------------------
+   Embedded album art — pulls the cover picture straight out of the song
+   file's own tag, the same way every mainstream player does it, so a
+   song shows its *real* artwork by default instead of a generated
+   placeholder. Three well-established, self-contained (no CDN/library
+   dependency, so it still works fully offline as an installed PWA)
+   readers cover the formats this app already plays:
+     - ID3v2 (mp3, and some m4a/wav): APIC frame (v2.3/2.4) or PIC (v2.2)
+     - FLAC: METADATA_BLOCK_PICTURE (block type 6) in the header
+     - MP4/M4A/AAC: the 'covr' atom under moov/udta/meta/ilst
+   Only a bounded prefix (and, for MP4 only, the whole file if it's not
+   too large) is ever read — never the entire library at once — so this
+   stays cheap even for large lossless files.
+   --------------------------------------------------------------------- */
+const EMBED_SCAN_CAP = 20 * 1024 * 1024;   // read up to 20MB looking for tag headers
+const MP4_FULL_SCAN_CAP = 80 * 1024 * 1024; // MP4 'moov' can trail the file; re-scan whole file up to this size
+
+function bytesToStr(bytes, start, len) {
+  let s = "";
+  for (let i = start; i < start + len && i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return s;
+}
+function sniffImageMime(bytes, offset) {
+  if (bytes[offset] === 0xFF && bytes[offset + 1] === 0xD8) return "image/jpeg";
+  if (bytes[offset] === 0x89 && bytes[offset + 1] === 0x50) return "image/png";
+  if (bytes[offset] === 0x47 && bytes[offset + 1] === 0x49) return "image/gif";
+  return "image/jpeg";
+}
+
+/* ---- ID3v2 (APIC / PIC) ---- */
+function parseID3v2Picture(bytes) {
+  if (bytesToStr(bytes, 0, 3) !== "ID3") return null;
+  const major = bytes[3];
+  const flags = bytes[5];
+  const synchsafe = (b0, b1, b2, b3) => ((b0 & 0x7f) << 21) | ((b1 & 0x7f) << 14) | ((b2 & 0x7f) << 7) | (b3 & 0x7f);
+  const tagSize = synchsafe(bytes[6], bytes[7], bytes[8], bytes[9]);
+  let pos = 10;
+  if (flags & 0x40) { // extended header present
+    const extSize = major >= 4 ? synchsafe(bytes[10], bytes[11], bytes[12], bytes[13]) : ((bytes[10] << 24) | (bytes[11] << 16) | (bytes[12] << 8) | bytes[13]);
+    pos += extSize;
+  }
+  const end = Math.min(bytes.length, 10 + tagSize);
+  while (pos < end - 10) {
+    let id, size, frameHeaderLen;
+    if (major === 2) {
+      id = bytesToStr(bytes, pos, 3);
+      size = (bytes[pos + 3] << 16) | (bytes[pos + 4] << 8) | bytes[pos + 5];
+      frameHeaderLen = 6;
+    } else {
+      id = bytesToStr(bytes, pos, 4);
+      size = major >= 4
+        ? synchsafe(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7])
+        : ((bytes[pos + 4] << 24) | (bytes[pos + 5] << 16) | (bytes[pos + 6] << 8) | bytes[pos + 7]);
+      frameHeaderLen = 10;
+    }
+    if (!id || size <= 0 || !/^[A-Z0-9]+$/.test(id)) break; // padding/garbage reached
+    const dataStart = pos + frameHeaderLen;
+    if (dataStart + size > bytes.length) break; // frame runs past what we read
+    if (id === "APIC" || id === "PIC") {
+      let p = dataStart;
+      const encoding = bytes[p]; p += 1;
+      let mime;
+      if (id === "PIC") { mime = bytesToStr(bytes, p, 3); p += 3; if (/jpg|jpeg/i.test(mime)) mime = "image/jpeg"; else if (/png/i.test(mime)) mime = "image/png"; else mime = "image/jpeg"; }
+      else {
+        let mEnd = p; while (mEnd < dataStart + size && bytes[mEnd] !== 0) mEnd++;
+        mime = bytesToStr(bytes, p, mEnd - p) || "image/jpeg";
+        p = mEnd + 1;
+      }
+      p += 1; // picture type byte
+      // skip null-terminated description (UTF-16 uses 2-byte terminator)
+      if (encoding === 1 || encoding === 2) {
+        while (p < dataStart + size - 1 && !(bytes[p] === 0 && bytes[p + 1] === 0)) p += 2;
+        p += 2;
+      } else {
+        while (p < dataStart + size && bytes[p] !== 0) p++;
+        p += 1;
+      }
+      const imgStart = p, imgEnd = dataStart + size;
+      if (imgEnd > imgStart) return { mime: mime.startsWith("image/") ? mime : sniffImageMime(bytes, imgStart), bytes: bytes.slice(imgStart, imgEnd) };
+    }
+    pos = dataStart + size;
+  }
+  return null;
+}
+
+/* ---- FLAC (METADATA_BLOCK_PICTURE) ---- */
+function parseFlacPicture(bytes) {
+  if (bytesToStr(bytes, 0, 4) !== "fLaC") return null;
+  let pos = 4;
+  const readU32 = (p) => (bytes[p] * 0x1000000) + ((bytes[p + 1] << 16) | (bytes[p + 2] << 8) | bytes[p + 3]);
+  while (pos + 4 <= bytes.length) {
+    const header = bytes[pos];
+    const isLast = (header & 0x80) !== 0;
+    const type = header & 0x7f;
+    const len = (bytes[pos + 1] << 16) | (bytes[pos + 2] << 8) | bytes[pos + 3];
+    const blockStart = pos + 4;
+    if (blockStart + len > bytes.length) break;
+    if (type === 6) {
+      let p = blockStart;
+      p += 4; // picture type
+      const mimeLen = readU32(p); p += 4;
+      const mime = bytesToStr(bytes, p, mimeLen) || "image/jpeg"; p += mimeLen;
+      const descLen = readU32(p); p += 4 + descLen;
+      p += 16; // width, height, depth, colors (4 bytes each)
+      const dataLen = readU32(p); p += 4;
+      if (p + dataLen <= bytes.length) return { mime: mime.startsWith("image/") ? mime : sniffImageMime(bytes, p), bytes: bytes.slice(p, p + dataLen) };
+      return null;
+    }
+    pos = blockStart + len;
+    if (isLast) break;
+  }
+  return null;
+}
+
+/* ---- MP4/M4A ('covr' atom under moov/udta/meta/ilst) ---- */
+function findMp4Covr(bytes) {
+  const len = bytes.length;
+  const readU32 = (p) => (bytes[p] * 0x1000000) + ((bytes[p + 1] << 16) | (bytes[p + 2] << 8) | bytes[p + 3]);
+  function walk(start, end, path) {
+    let pos = start;
+    while (pos + 8 <= end) {
+      let size = readU32(pos);
+      const type = bytesToStr(bytes, pos + 4, 4);
+      let headerLen = 8;
+      if (size === 1) { // 64-bit extended size — not expected for these small boxes, bail
+        return null;
+      }
+      if (size === 0) size = end - pos; // box extends to end of parent
+      if (size < 8 || pos + size > end) break;
+      const childStart = pos + headerLen;
+      const childEnd = pos + size;
+      if (type === "moov" || type === "udta" || type === "ilst") {
+        const found = walk(childStart, childEnd, path.concat(type));
+        if (found) return found;
+      } else if (type === "meta") {
+        // 'meta' has a 4-byte version/flags field before its children
+        const found = walk(childStart + 4, childEnd, path.concat(type));
+        if (found) return found;
+      } else if (type === "covr") {
+        // 'covr' contains one or more 'data' boxes; take the first
+        let dp = childStart;
+        while (dp + 16 <= childEnd) {
+          const dsize = readU32(dp);
+          const dtype = bytesToStr(bytes, dp + 4, 4);
+          if (dtype === "data" && dsize > 16) {
+            const flagsByte = bytes[dp + 8 + 3]; // type indicator, low byte
+            const dataStart = dp + 16, dataEnd = dp + dsize;
+            const mime = flagsByte === 14 ? "image/png" : "image/jpeg";
+            if (dataEnd <= childEnd) return { mime, bytes: bytes.slice(dataStart, dataEnd) };
+          }
+          if (dsize < 8) break;
+          dp += dsize;
+        }
+      }
+      pos += size;
+    }
+    return null;
+  }
+  return walk(0, len, []);
+}
+
+/** Reads just enough of a file to find its cover picture (if any),
+ *  returning {mime, bytes:Uint8Array} or null. Never throws — any parse
+ *  failure just means "no embedded art found", falling back later to a
+ *  generated icon like before. */
+async function extractRawPictureBlob(file) {
+  try {
+    const head = new Uint8Array(await file.slice(0, Math.min(file.size, 4096)).arrayBuffer());
+    const magic4 = bytesToStr(head, 0, 4);
+    if (magic4 === "ID3\x03" || magic4 === "ID3\x04" || magic4 === "ID3\x02" || bytesToStr(head, 0, 3) === "ID3") {
+      const buf = new Uint8Array(await file.slice(0, Math.min(file.size, EMBED_SCAN_CAP)).arrayBuffer());
+      return parseID3v2Picture(buf);
+    }
+    if (magic4 === "fLaC") {
+      const buf = new Uint8Array(await file.slice(0, Math.min(file.size, EMBED_SCAN_CAP)).arrayBuffer());
+      return parseFlacPicture(buf);
+    }
+    // MP4 family: 'ftyp' box normally sits right at the start (after a 4-byte size)
+    const boxType = bytesToStr(head, 4, 4);
+    if (boxType === "ftyp") {
+      let buf = new Uint8Array(await file.slice(0, Math.min(file.size, EMBED_SCAN_CAP)).arrayBuffer());
+      let found = findMp4Covr(buf);
+      if (!found && file.size > buf.length && file.size <= MP4_FULL_SCAN_CAP) {
+        // 'moov' (which holds the cover) sometimes trails after 'mdat' —
+        // fall back to reading the whole file, but only if it's not huge.
+        buf = new Uint8Array(await file.arrayBuffer());
+        found = findMp4Covr(buf);
+      }
+      return found;
+    }
+  } catch { /* fall through — no embedded art */ }
+  return null;
+}
+
+/** Full pipeline: extract the song's own embedded cover (if any) and
+ *  normalize it into the same 512x512 JPEG data URL shape as
+ *  resizeImageFileToDataUrl produces for user-uploaded photos, so it
+ *  drops into every existing art call site unchanged. Returns null when
+ *  the file has no readable embedded picture. */
+async function getEmbeddedArtForFile(file) {
+  const pic = await extractRawPictureBlob(file);
+  if (!pic || !pic.bytes || !pic.bytes.length) return null;
+  try {
+    const blob = new Blob([pic.bytes], { type: pic.mime || "image/jpeg" });
+    return await resizeImageFileToDataUrl(blob, 512, 0.86);
+  } catch { return null; }
 }
 
 /* ---------------------------------------------------------------------
@@ -405,6 +675,20 @@ async function walkDirectory(dirHandle, extRegex, onProgress) {
   await walk(dirHandle, "");
   return found;
 }
+
+/* ---------------------------------------------------------------------
+   Recognized audio file extensions — the single source of truth for
+   which files count as "a song" anywhere files are scanned (main
+   library folder scan, DJ Mode's folder scan, the <input webkitdirectory>
+   fallback picker). Deliberately broad: covers every mainstream audio
+   container/codec a user is likely to have on device, not just the
+   handful iTunes/Spotify default to, so nothing gets silently skipped
+   during a folder scan just because its extension wasn't on a short
+   allowlist. Whether a given file then actually *plays* still depends on
+   the browser/OS having a decoder for its codec — playSong below now
+   catches that case and skips forward with a toast instead of just
+   silently stalling. */
+const AUDIO_EXT = /\.(mp3|mp2|m4a|m4b|m4p|m4r|aac|wav|wave|flac|ogg|oga|ogx|opus|weba|webm|wma|aiff|aif|aifc|amr|mka|caf|3gp|3g2|3ga|spx|ape|mpc|tta|wv|au|snd|mid|midi)$/i;
 
 /* ---------------------------------------------------------------------
    Small canvas-drawing helpers mirroring the Android Canvas/Paint API
@@ -1324,12 +1608,13 @@ const GlobeTitle = (function () {
    Public export
    --------------------------------------------------------------------- */
 global.VV = {
-  idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbPut,
+  idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut,
   FONTS, applyFont,
-  fsApiSupported, verifyPermission, pickDirectory, getStoredHandle, walkDirectory,
+  fsApiSupported, verifyPermission, pickDirectory, getStoredHandle, walkDirectory, AUDIO_EXT,
   ThemeEngine, PixieDust, BookTransition, GlobeTitle,
   C, linGrad, radGrad, fillGrad,
   generatedArt, hashStr, setArtStyle, getArtStyle, ART_STYLES, drawSkullIcon,
+  resizeImageFileToDataUrl, extractRawPictureBlob, getEmbeddedArtForFile,
 };
 
 })(window);

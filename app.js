@@ -11,12 +11,16 @@
    IndexedDB — delegated to shared.js (VV) so index/video/recap pages
    never open the database at different versions and block each other.
    --------------------------------------------------------------------- */
-const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbPut } = window.VV;
+const { idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut } = window.VV;
 
 /* ---------------------------------------------------------------------
    State
    --------------------------------------------------------------------- */
-const AUDIO_EXT = /\.(mp3|m4a|aac|wav|ogg|oga|flac|opus|weba|webm)$/i;
+// Recognized audio extensions live in shared.js (window.VV.AUDIO_EXT) so
+// the main library scan, DJ Mode's scan, and the folder-picker fallback
+// all agree on what counts as "a song" — see the comment there for the
+// full list and rationale.
+const AUDIO_EXT = window.VV.AUDIO_EXT;
 const RECENT_CAP = 100;
 
 const state = {
@@ -41,11 +45,13 @@ const state = {
   repeat: "off",         // off | all | one
   isPlaying: false,
   addToPlaylistTargetId: null,
-  settings: { light: false, resume: true, fontStyle: 0, themeId: "none", accentColor: "#C9A84C", accent2Color: "#B22222", artStyle: "sigil", rageMode: false, rageBackground: "none", rageDripType: "smoke" },
+  settings: { light: false, resume: true, fontStyle: 0, themeId: "none", accentColor: "#C9A84C", accent2Color: "#B22222", artStyle: "sigil", rageMode: false, rageBackground: "none", rageDripType: "smoke", overlayStrength: 55 },
   usingFSApi: false,
   fileRefs: new Map(),   // songId -> File or FileSystemFileHandle
   objectUrl: null,
   artCache: new Map(),   // unused (kept for backward compat with any external references)
+  customArt: new Map(),  // songId -> custom album art data URL (uploaded from device), see loadUserData
+  embeddedArt: new Map(), // songId -> the song file's own cover art, extracted from its tag (see loadUserData / loadMetadataProgressively)
 };
 
 const audio = new Audio();
@@ -98,6 +104,9 @@ const els = {
   playerCollapseBtn: $("#playerCollapseBtn"),
   playerQueueTopBtn: $("#playerQueueTopBtn"),
   playerArt: $("#playerArt"),
+  editArtBtn: $("#editArtBtn"),
+  resetArtBtn: $("#resetArtBtn"),
+  albumArtUploadInput: $("#albumArtUploadInput"),
   playerTitle: $("#playerTitle"),
   playerArtist: $("#playerArtist"),
   playerSourceLabel: $("#playerSourceLabel"),
@@ -141,6 +150,8 @@ const els = {
   rageModeSwitch: $("#rageModeSwitch"),
   closeSettingsBtn: $("#closeSettingsBtn"),
   settingsRescanBtn: $("#settingsRescanBtn"),
+  overlayStrengthInput: $("#overlayStrengthInput"),
+  overlayStrengthValue: $("#overlayStrengthValue"),
 
   iosModalOverlay: $("#iosModalOverlay"),
   closeIosModalBtn: $("#closeIosModalBtn"),
@@ -182,14 +193,20 @@ function titleCaseFromFilename(name) {
   return { artist: "", title: cleaned };
 }
 
-/* Album art rendering — delegates to window.VV.generatedArt (shared.js)
-   so it always reflects the currently selected Album Art Style. This used
-   to have its own local sigil-only generator + cache here that ignored
-   Settings → Album Art Style entirely (the art never updated when you
-   picked a different style); that duplicate has been removed so this is
-   now the single source of truth, same as the rest of the app. */
+/* Album art rendering — priority order is: 1) a custom photo uploaded
+   from device storage (Settings-free — set via the full player's
+   edit-art button), 2) the song file's OWN embedded cover art (read
+   straight out of its ID3v2/FLAC/MP4 tag the first time its metadata is
+   scanned — see loadMetadataProgressively/getEmbeddedArtForFile in
+   shared.js), so the real album art is what shows by default, and only
+   3) a generated placeholder for songs that have no embedded picture at
+   all, which delegates to window.VV.generatedArt so it always reflects
+   the currently selected Album Art Style. */
+function resolveArtUrl(song) {
+  return state.customArt.get(song.id) || state.embeddedArt.get(song.id) || window.VV.generatedArt(song.title + song.artist + song.id, 160);
+}
 function artHtml(song, sizeAttr = "") {
-  const url = window.VV.generatedArt(song.title + song.artist + song.id, 160);
+  const url = resolveArtUrl(song);
   return `<img src="${url}" alt="" loading="lazy">`;
 }
 
@@ -257,22 +274,47 @@ const RAVEN_LINES = ["RAVENS DISPATCHED...", "SCROLLS UNSEALED", "THE LIBRARY AW
 const RAGE_LINES = ["THE CROWD ROARS", "BASS INCOMING", "FEEL THE DROP", "PYRO ARMED", "SUB-BASS ENGAGED", "MOSH PIT ACTIVE", "TURN IT UP", "ENERGY MAXED"];
 
 /* ---------------------------------------------------------------------
-   Rage Mode background images — four selectable full-screen backdrops,
-   only ever shown while Rage Mode is on (Settings → 🔥 Rage Background).
-   Files sit flat alongside the other app assets (no subfolder), so
-   dropping in replacement art just means overwriting these four
-   filenames. When "None" is selected, Rage Mode falls back to its
-   built-in canvas-drawn Demon's Den scene as before. The smoke / ember /
-   eyes canvas layer always renders on TOP of whichever background is
-   chosen.
+   Background images — four selectable full-screen backdrops (Settings →
+   🖼 Background Image). Previously these only ever showed while Rage
+   Mode was on; they now apply in every mode — Light, Dark, and Rage —
+   since #rageBgLayer's display is no longer gated by html.rage-active
+   in style.css. Files sit flat alongside the other app assets (no
+   subfolder), so dropping in replacement art just means overwriting
+   these four filenames. When "None" is selected: in Rage Mode this
+   falls back to the built-in canvas-drawn Demon's Den scene as before;
+   in Light/Dark mode it just falls back to the normal animated theme
+   background. The smoke / ember / eyes canvas layer (Rage Mode only)
+   always renders on TOP of whichever background is chosen.
    --------------------------------------------------------------------- */
 const RAGE_BACKGROUNDS = [
-  { id: "none", label: "Den (default)" },
+  { id: "none", label: "None (default)" },
   { id: "bg1", label: "Atomic 1", file: "Atomic1_0.jpeg" },
   { id: "bg2", label: "Atomic 2", file: "Atomic2_0.jpeg" },
   { id: "bg3", label: "Hell 1", file: "Hell1_0.jpeg" },
   { id: "bg4", label: "Hell 2", file: "Hell2_0.jpeg" },
 ];
+/* A user-uploaded background photo (Settings → 🖼 Background Image →
+   Upload Photo). The file itself is stored as a Blob in IndexedDB
+   ("kv"/"customBgImage") so it survives reloads; customBgObjectUrl is
+   just the in-memory object URL created from that Blob for the current
+   page load, revoked and recreated whenever the photo changes. Selecting
+   it sets state.settings.rageBackground = "custom", same as any preset. */
+const CUSTOM_BG_MAX_BYTES = 8 * 1024 * 1024; // 8MB cap for user-uploaded photos (background image + custom album art) — keeps IndexedDB snappy
+let customBgObjectUrl = null;
+
+/* ---------------------------------------------------------------------
+   Custom video background — Settings → Animated Background lets the
+   user pick a video from device storage to use as the animated
+   background instead of one of the 42 built-in canvas themes. Stored as
+   a Blob in IndexedDB ("kv"/"customBgVideo") so it survives reloads;
+   customBgVideoObjectUrl is the in-memory object URL for the current
+   page load. Selecting it sets state.settings.themeId = "customVideo",
+   which — since that id isn't one of ThemeEngine's known themes —
+   already makes the canvas draw nothing on its own; applyThemeVideo()
+   below just shows the <video> layer on top whenever that id is active.
+   --------------------------------------------------------------------- */
+const CUSTOM_BG_VIDEO_MAX_BYTES = 60 * 1024 * 1024; // 60MB cap — generous for a short looping clip, keeps IndexedDB usable
+let customBgVideoObjectUrl = null;
 
 /* ---------------------------------------------------------------------
    Rage Mode ambience effect — what billows across the screen. "Intense
@@ -850,6 +892,7 @@ async function loadMetadataProgressively(entries, isFsApi) {
           song.size = file.size;
           song.dateAdded = file.lastModified || Date.now();
           await loadDuration(file, song);
+          await loadEmbeddedArt(file, song);
         }
       } catch (err) { /* skip unreadable file */ }
       done++;
@@ -880,6 +923,24 @@ function loadDuration(file, song) {
   });
 }
 
+/** Reads the song file's own embedded cover art (ID3v2/FLAC/MP4 tag) the
+ *  first time we ever see this song, caches it in IndexedDB so it's
+ *  instant on every later load, and — if this song happens to be the
+ *  one currently open in the mini/full player — refreshes that art
+ *  immediately instead of waiting for the next periodic re-render. Skips
+ *  the work entirely for songs that already have a custom photo (which
+ *  always wins anyway) or that we've already extracted art for. */
+async function loadEmbeddedArt(file, song) {
+  if (state.customArt.has(song.id) || state.embeddedArt.has(song.id)) return;
+  try {
+    const dataUrl = await window.VV.getEmbeddedArtForFile(file);
+    if (!dataUrl) return;
+    state.embeddedArt.set(song.id, dataUrl);
+    idbSet("embeddedArt", song.id, dataUrl); // fire-and-forget cache write
+    if (state.queue[state.queueIndex] === song.id) { syncNowPlayingUI(song); updateMediaSession(song); }
+  } catch { /* no embedded art — falls back to generated art as before */ }
+}
+
 function finishOnboarding() {
   hideConnecting();
   els.onboarding.classList.add("hidden");
@@ -892,7 +953,7 @@ function finishOnboarding() {
    Persisted user data: playlists / favorites / play counts / settings
    --------------------------------------------------------------------- */
 async function loadUserData() {
-  const [playlists, favKeys, pcEntries, settings, recent] = await Promise.all([
+  const [playlists, favKeys, pcEntries, settings, recent, customBgBlob, customArtEntries, embeddedArtEntries, customBgVideoBlob] = await Promise.all([
     idbGetAll("playlists"),
     idbGetAllKeys("favorites"),
     (async () => {
@@ -911,11 +972,28 @@ async function loadUserData() {
     })(),
     idbGet("kv", "settings"),
     idbGet("kv", "recentlyPlayed"),
+    idbGet("kv", "customBgImage"),
+    idbGetAllEntries("customArt"),
+    idbGetAllEntries("embeddedArt"),
+    idbGet("kv", "customBgVideo"),
   ]);
   state.playlists = playlists || [];
   state.favorites = new Set(favKeys || []);
   state.playCounts = new Map(pcEntries || []);
   state.recentlyPlayed = recent || [];
+  state.customArt = new Map(customArtEntries || []);
+  state.embeddedArt = new Map(embeddedArtEntries || []);
+  // Re-derive an object URL for the uploaded background photo, if any —
+  // object URLs don't survive a page reload, but the Blob behind it does.
+  if (customBgBlob) {
+    if (customBgObjectUrl) URL.revokeObjectURL(customBgObjectUrl);
+    customBgObjectUrl = URL.createObjectURL(customBgBlob);
+  }
+  // Same idea for a user-uploaded custom video background.
+  if (customBgVideoBlob) {
+    if (customBgVideoObjectUrl) URL.revokeObjectURL(customBgVideoObjectUrl);
+    customBgVideoObjectUrl = URL.createObjectURL(customBgVideoBlob);
+  }
   if (settings) state.settings = { ...state.settings, ...settings };
   applySettingsToUI();
 }
@@ -1314,10 +1392,19 @@ async function loadAndPlayCurrent() {
   if (!file) { toast("Couldn't read that file."); return; }
   if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
   state.objectUrl = URL.createObjectURL(file);
+  const myLoadToken = ++audioLoadToken; // guards against a stale play()/error firing after a newer track has already started loading
   audio.src = state.objectUrl;
   RageMode.ensureAudioGraph();
-  try { await audio.play(); state.isPlaying = true; }
-  catch (err) { state.isPlaying = false; }
+  try {
+    await audio.play();
+    if (myLoadToken !== audioLoadToken) return;
+    state.isPlaying = true;
+  } catch (err) {
+    if (myLoadToken !== audioLoadToken) return;
+    state.isPlaying = false;
+    handleUnplayableSong(song, err);
+    return;
+  }
   bumpPlayCount(songId);
   bumpMonthStat(song);
   recordRecentlyPlayed(songId);
@@ -1325,6 +1412,17 @@ async function loadAndPlayCurrent() {
   syncNowPlayingUI(song);
   updateMediaSession(song);
   render();
+}
+let audioLoadToken = 0;
+/** Broadening which extensions count as "a song" (see AUDIO_EXT) means
+ *  some files that get found and added still won't have a decoder the
+ *  browser/OS actually supports — e.g. WMA, MIDI, or an unusual codec
+ *  inside a common container. Rather than leaving playback silently
+ *  stuck on a track that will never start, let the person know and move
+ *  on automatically instead of stalling the queue. */
+function handleUnplayableSong(song) {
+  toast(`Can't play "${song.title}" — unsupported audio format on this device.`, 3200);
+  if (state.queue.length > 1) setTimeout(() => nextSong(true), 500);
 }
 
 /* ---------------------------------------------------------------------
@@ -1362,7 +1460,15 @@ function syncNowPlayingUI(song) {
   els.playerArtist.textContent = song.artist;
   els.playerSourceLabel.textContent = song.album || "Now Playing";
   syncPlayerFavIcon();
+  syncPlayerArtButtons(song);
   setPlayIcon(state.isPlaying);
+}
+/** Shows the "reset to default art" button only when the currently
+ *  playing song has a custom photo uploaded; the edit (pencil) button
+ *  is always visible so a photo can be added or replaced any time. */
+function syncPlayerArtButtons(song) {
+  if (!els.resetArtBtn) return;
+  els.resetArtBtn.classList.toggle("hidden", !state.customArt.has(song.id));
 }
 function syncPlayerFavIcon() {
   const songId = state.queue[state.queueIndex];
@@ -1451,6 +1557,15 @@ audio.addEventListener("timeupdate", () => {
 audio.addEventListener("ended", () => nextSong(true));
 audio.addEventListener("play", () => { state.isPlaying = true; setPlayIcon(true); });
 audio.addEventListener("pause", () => { state.isPlaying = false; setPlayIcon(false); });
+/** Covers the case where a file's src loads far enough for play() to
+ *  resolve but decoding then fails (corrupt file, or a codec the
+ *  container claims to hold but this browser can't actually decode) —
+ *  same graceful skip-forward as the play()-rejection path above. */
+audio.addEventListener("error", () => {
+  if (!audio.error) return;
+  const song = state.songs.find(s => s.id === state.queue[state.queueIndex]);
+  if (song) { state.isPlaying = false; handleUnplayableSong(song); }
+});
 
 function seekTo(clientX) {
   const rect = els.seekTrack.getBoundingClientRect();
@@ -1465,9 +1580,11 @@ window.addEventListener("pointerup", () => { seeking = false; });
 /* Media Session — lock screen / notification controls */
 function updateMediaSession(song) {
   if (!("mediaSession" in navigator)) return;
+  const custom = state.customArt.get(song.id) || state.embeddedArt.get(song.id);
+  const art = custom || window.VV.generatedArt(song.title + song.artist + song.id, 512);
   navigator.mediaSession.metadata = new MediaMetadata({
     title: song.title, artist: song.artist, album: song.album || "Vvynas Vane",
-    artwork: [{ src: window.VV.generatedArt(song.title + song.artist + song.id, 512), sizes: "512x512", type: "image/png" }],
+    artwork: [{ src: art, sizes: "512x512", type: custom ? "image/jpeg" : "image/png" }],
   });
   navigator.mediaSession.setActionHandler("play", togglePlay);
   navigator.mediaSession.setActionHandler("pause", togglePlay);
@@ -1557,6 +1674,8 @@ function applySettingsToUI() {
   // instead of a one-frame flash of stale defaults.
   applyRageBackground();
   applyRageDripType();
+  applyThemeVideo();
+  applyOverlayStrength();
   RageMode.setActive(state.settings.rageMode);
   renderFontGrid();
   renderThemeGrid();
@@ -1565,28 +1684,53 @@ function applySettingsToUI() {
   renderRageDripGrid();
   render(); // re-render current view so album art picks up the new style immediately
 }
-/** Populates the Rage Background picker in Settings. The picker itself
- *  is always visible so it can be set up in advance, but the chosen
- *  image is only ever actually displayed while Rage Mode is switched on
- *  (see #rageBgLayer / html.rage-active in style.css). */
+/** Populates the Background Image picker in Settings. The chosen image
+ *  now displays in every mode — Light, Dark, and Rage — not just while
+ *  Rage Mode is switched on (see #rageBgLayer in style.css). */
 function renderRageBgGrid() {
   const grid = document.getElementById("rageBgGrid");
   if (!grid) return;
-  grid.innerHTML = RAGE_BACKGROUNDS.map(b => `
+  const presetTiles = RAGE_BACKGROUNDS.map(b => `
     <div class="rage-bg-option ${state.settings.rageBackground === b.id ? "active" : ""}" data-rage-bg="${b.id}">
       ${b.id === "none"
         ? `<div class="swatch none-swatch">🩸</div>`
         : `<div class="swatch" style="background-image:url('${b.file}')"></div>`}
       <div class="lbl">${b.label}</div>
     </div>`).join("");
+  // The uploaded photo, if one is stored, gets its own selectable tile
+  // (with a ✕ to remove it) alongside the four presets.
+  const customTile = customBgObjectUrl ? `
+    <div class="rage-bg-option ${state.settings.rageBackground === "custom" ? "active" : ""}" data-rage-bg="custom">
+      <div class="swatch" style="background-image:url('${customBgObjectUrl}')"></div>
+      <div class="lbl">My Photo <span class="rage-bg-remove" data-remove-custom-bg title="Remove uploaded photo">✕</span></div>
+    </div>` : "";
+  // Always-present tile that opens the device file picker — doubles as
+  // "Upload Photo" (none stored yet) or "Replace Photo" (one already is).
+  const uploadTile = `
+    <div class="rage-bg-option rage-bg-upload" data-upload-bg>
+      <div class="swatch none-swatch">📁</div>
+      <div class="lbl">${customBgObjectUrl ? "Replace Photo" : "Upload Photo"}</div>
+    </div>`;
+  grid.innerHTML = presetTiles + customTile + uploadTile;
 }
-/** Applies the currently selected Rage Background: sets the CSS layer's
- *  image and tells RageMode's canvas to wash translucent (so the image
- *  shows through, with the blood/embers/eyes drawn on top) instead of
- *  painting its own opaque Demon's Den floor. */
+/** Applies the currently selected Background Image: sets the CSS layer's
+ *  image (now shown in every mode, not just Rage Mode) and tells
+ *  RageMode's canvas to wash translucent when Rage Mode is active (so
+ *  the image shows through, with the embers/eyes drawn on top) instead
+ *  of painting its own opaque Demon's Den floor. */
 function applyRageBackground() {
   const layer = document.getElementById("rageBgLayer");
   if (!layer) return;
+  // Custom upload takes a separate path since its image lives in an
+  // object URL rather than a static filename in RAGE_BACKGROUNDS. If
+  // "custom" is selected but there's no image behind it (e.g. it was
+  // never re-loaded successfully), fall through to the "none" default.
+  if (state.settings.rageBackground === "custom" && customBgObjectUrl) {
+    layer.style.backgroundImage = `url("${customBgObjectUrl}")`;
+    layer.classList.add("active");
+    RageMode.setBackgroundActive(true);
+    return;
+  }
   const bg = RAGE_BACKGROUNDS.find(b => b.id === state.settings.rageBackground) || RAGE_BACKGROUNDS[0];
   if (bg.id === "none") {
     layer.classList.remove("active");
@@ -1663,8 +1807,58 @@ function renderFontGrid() {
 function renderThemeGrid() {
   const grid = document.getElementById("themeGrid");
   if (!grid) return;
-  grid.innerHTML = window.VV.ThemeEngine.THEME_LIST.map(t => `
+  const presetTiles = window.VV.ThemeEngine.THEME_LIST.map(t => `
     <div class="theme-option ${state.settings.themeId === t.id ? "active" : ""}" data-theme-id="${t.id}">${t.label}</div>`).join("");
+  // A user-uploaded video, if one is stored, gets its own selectable
+  // full-width tile (with a live muted preview + a ✕ to remove it).
+  const videoTile = customBgVideoObjectUrl ? `
+    <div class="theme-option theme-video-option ${state.settings.themeId === "customVideo" ? "active" : ""}" data-theme-id="customVideo">
+      <video class="video-thumb" src="${customBgVideoObjectUrl}" muted loop autoplay playsinline></video>
+      <div class="lbl">My Video</div>
+      <span class="rage-bg-remove" data-remove-custom-video title="Remove uploaded video">✕</span>
+    </div>` : "";
+  // Always-present tile that opens the device file picker.
+  const uploadTile = `
+    <div class="theme-option theme-video-option theme-video-upload" data-upload-video>
+      <div class="video-thumb">🎬</div>
+      <div class="lbl">${customBgVideoObjectUrl ? "Replace Video" : "Upload Your Own Video"}</div>
+    </div>`;
+  grid.innerHTML = presetTiles + videoTile + uploadTile;
+}
+/** Shows/hides the custom-video background layer and keeps it playing in
+ *  sync with whether it's the currently selected "theme". Since
+ *  "customVideo" isn't one of ThemeEngine's known theme ids, the canvas
+ *  it would otherwise draw on already renders nothing for it — this just
+ *  layers the actual <video> on top when it's active. */
+function applyThemeVideo() {
+  const layer = document.getElementById("bgVideoLayer");
+  if (!layer) return;
+  if (state.settings.themeId === "customVideo" && customBgVideoObjectUrl) {
+    if (layer.src !== customBgVideoObjectUrl) layer.src = customBgVideoObjectUrl;
+    layer.classList.add("active");
+    layer.play().catch(() => { /* autoplay may need a user gesture on some browsers — it'll start on first interaction */ });
+  } else {
+    layer.classList.remove("active");
+    layer.pause();
+  }
+}
+/** Maps Settings → "Now Playing Overlay Strength" (0-100) onto the CSS
+ *  variables the full player's scrim and the song-title/artist text
+ *  shadows read from, so the details stay legible whether the chosen
+ *  background is a busy video, a bright photo, or a dark canvas theme.
+ *  0 = background maximally visible, 100 = details maximally shielded. */
+function applyOverlayStrength() {
+  const v = state.settings.overlayStrength ?? 55;
+  const t = Math.max(0, Math.min(100, v)) / 100;
+  const root = document.documentElement.style;
+  root.setProperty("--np-overlay-a", (0.08 + t * 0.62).toFixed(2));
+  root.setProperty("--np-overlay-mid", (0.20 + t * 0.65).toFixed(2));
+  root.setProperty("--np-overlay-b", (0.35 + t * 0.55).toFixed(2));
+  root.setProperty("--np-text-shadow-blur", (2 + t * 12).toFixed(1) + "px");
+  root.setProperty("--np-text-shadow-a", (0.25 + t * 0.6).toFixed(2));
+  root.setProperty("--np-mini-bg-a", (0.55 + t * 0.4).toFixed(2));
+  if (els.overlayStrengthInput) els.overlayStrengthInput.value = String(v);
+  if (els.overlayStrengthValue) els.overlayStrengthValue.textContent = v + "%";
 }
 function openSettings() { els.settingsModalOverlay.classList.add("open"); renderFontGrid(); renderThemeGrid(); renderArtStyleGrid(); renderRageBgGrid(); renderRageDripGrid(); }
 function closeSettings() { els.settingsModalOverlay.classList.remove("open"); }
@@ -1746,18 +1940,81 @@ document.getElementById("fontGrid").addEventListener("click", (e) => {
   applySettingsToUI(); saveSettings();
 });
 document.getElementById("themeGrid").addEventListener("click", (e) => {
+  const removeBtn = e.target.closest("[data-remove-custom-video]");
+  if (removeBtn) { e.stopPropagation(); removeCustomBgVideo(); return; }
+  const uploadTile = e.target.closest("[data-upload-video]");
+  if (uploadTile) { document.getElementById("themeVideoUploadInput").click(); return; }
   const opt = e.target.closest("[data-theme-id]");
   if (!opt) return;
   state.settings.themeId = opt.dataset.themeId;
   applySettingsToUI(); saveSettings();
-  toast(opt.dataset.themeId === "none" ? "Background off" : `Theme: ${opt.textContent}`);
+  toast(opt.dataset.themeId === "none" ? "Background off" : opt.dataset.themeId === "customVideo" ? "Background: My Video" : `Theme: ${opt.textContent}`);
 });
+/** Reads a device video picked via the hidden file input, stores it as a
+ *  Blob in IndexedDB so it persists across reloads, and selects it as
+ *  the active animated background immediately. */
+document.getElementById("themeVideoUploadInput").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ""; // reset so choosing the same file again still fires "change"
+  if (!file) return;
+  if (!file.type.startsWith("video/")) { toast("Please choose a video file."); return; }
+  if (file.size > CUSTOM_BG_VIDEO_MAX_BYTES) { toast("That video is too large — please pick one under 60MB."); return; }
+  await idbSet("kv", "customBgVideo", file);
+  if (customBgVideoObjectUrl) URL.revokeObjectURL(customBgVideoObjectUrl);
+  customBgVideoObjectUrl = URL.createObjectURL(file);
+  state.settings.themeId = "customVideo";
+  applySettingsToUI(); saveSettings();
+  toast("Background video uploaded.");
+});
+/** Deletes the stored custom background video. Falls back to "None" if
+ *  it was the active background. */
+async function removeCustomBgVideo() {
+  await idbDelete("kv", "customBgVideo");
+  if (customBgVideoObjectUrl) { URL.revokeObjectURL(customBgVideoObjectUrl); customBgVideoObjectUrl = null; }
+  if (state.settings.themeId === "customVideo") state.settings.themeId = "none";
+  applySettingsToUI(); saveSettings();
+  toast("Background video removed.");
+}
+els.overlayStrengthInput.addEventListener("input", () => {
+  state.settings.overlayStrength = Number(els.overlayStrengthInput.value);
+  applyOverlayStrength();
+});
+els.overlayStrengthInput.addEventListener("change", saveSettings);
 document.getElementById("rageBgGrid").addEventListener("click", (e) => {
-  const opt = e.target.closest(".rage-bg-option");
+  const removeBtn = e.target.closest("[data-remove-custom-bg]");
+  if (removeBtn) { e.stopPropagation(); removeCustomBgImage(); return; }
+  const uploadTile = e.target.closest("[data-upload-bg]");
+  if (uploadTile) { document.getElementById("rageBgUploadInput").click(); return; }
+  const opt = e.target.closest(".rage-bg-option[data-rage-bg]");
   if (!opt) return;
   state.settings.rageBackground = opt.dataset.rageBg;
   renderRageBgGrid(); applyRageBackground(); saveSettings();
 });
+/** Reads a device photo picked via the hidden file input, stores it as a
+ *  Blob in IndexedDB so it persists across reloads, and selects it as
+ *  the active background image immediately. */
+document.getElementById("rageBgUploadInput").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ""; // reset so choosing the same file again still fires "change"
+  if (!file) return;
+  if (!file.type.startsWith("image/")) { toast("Please choose an image file."); return; }
+  if (file.size > CUSTOM_BG_MAX_BYTES) { toast("That image is too large — please pick one under 8MB."); return; }
+  await idbSet("kv", "customBgImage", file);
+  if (customBgObjectUrl) URL.revokeObjectURL(customBgObjectUrl);
+  customBgObjectUrl = URL.createObjectURL(file);
+  state.settings.rageBackground = "custom";
+  renderRageBgGrid(); applyRageBackground(); saveSettings();
+  toast("Background photo uploaded.");
+});
+/** Deletes the stored custom background photo. Falls back to "None" if
+ *  it was the active background. */
+async function removeCustomBgImage() {
+  await idbDelete("kv", "customBgImage");
+  if (customBgObjectUrl) { URL.revokeObjectURL(customBgObjectUrl); customBgObjectUrl = null; }
+  if (state.settings.rageBackground === "custom") state.settings.rageBackground = "none";
+  renderRageBgGrid(); applyRageBackground(); saveSettings();
+  toast("Background photo removed.");
+}
 document.getElementById("rageDripGrid").addEventListener("click", (e) => {
   const opt = e.target.closest(".rage-drip-option");
   if (!opt) return;
@@ -1917,6 +2174,46 @@ els.repeatBtn.addEventListener("click", cycleRepeat);
 els.favBtn.addEventListener("click", () => { const id = state.queue[state.queueIndex]; if (id) toggleFavorite(id); });
 els.addToPlaylistBtn.addEventListener("click", () => { const id = state.queue[state.queueIndex]; if (id) openPlaylistModal(id); });
 els.queueBtn.addEventListener("click", openQueue);
+
+/* Custom album art — pick a photo from device storage for the song
+   currently open in the full player. Any resolution/aspect ratio goes
+   in; resizeImageFileToDataUrl (shared.js) normalizes it into a square
+   512x512 JPEG so it's compatible everywhere art is shown. */
+els.editArtBtn.addEventListener("click", () => {
+  const id = state.queue[state.queueIndex];
+  if (!id) { toast("Nothing playing yet."); return; }
+  els.albumArtUploadInput.click();
+});
+els.albumArtUploadInput.addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ""; // reset so picking the same file again still fires "change"
+  if (!file) return;
+  const songId = state.queue[state.queueIndex];
+  if (!songId) return;
+  if (!file.type.startsWith("image/")) { toast("Please choose an image file."); return; }
+  if (file.size > CUSTOM_BG_MAX_BYTES) { toast("That image is too large — please pick one under 8MB."); return; }
+  try {
+    const dataUrl = await window.VV.resizeImageFileToDataUrl(file, 512, 0.86);
+    await idbSet("customArt", songId, dataUrl);
+    state.customArt.set(songId, dataUrl);
+    const song = state.songs.find(s => s.id === songId);
+    if (song) { syncNowPlayingUI(song); updateMediaSession(song); }
+    render(); // library rows / playlists picking up the new art
+    toast("Album art updated.");
+  } catch {
+    toast("Couldn't read that image — try a different file.");
+  }
+});
+els.resetArtBtn.addEventListener("click", async () => {
+  const songId = state.queue[state.queueIndex];
+  if (!songId || !state.customArt.has(songId)) return;
+  await idbDelete("customArt", songId);
+  state.customArt.delete(songId);
+  const song = state.songs.find(s => s.id === songId);
+  if (song) { syncNowPlayingUI(song); updateMediaSession(song); }
+  render();
+  toast("Album art reset to default.");
+});
 
 els.closeQueueBtn.addEventListener("click", closeQueue);
 els.sheetOverlay.addEventListener("click", closeQueue);

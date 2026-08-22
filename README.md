@@ -57,6 +57,16 @@ python3 -m http.server 8080
   `shared.js`; it now always goes through the shared generator, so style
   changes apply immediately everywhere (library rows, mini-player, full
   player, lock-screen artwork).
+- **Custom album art per song** (full player → pencil icon on the
+  artwork): pick a photo straight from device storage to use as that
+  song's cover instead of the generated art. Any size or aspect ratio
+  goes in — it's automatically center-cropped to a square and resized to
+  512x512 so it displays correctly and consistently everywhere art shows
+  up (library rows, mini-player, full player, lock-screen controls),
+  same as the generated styles above. Stored on-device (IndexedDB), so
+  it's still there next time you open the app; a second button next to
+  the pencil resets a song back to its generated art. 8MB cap per photo,
+  nothing ever leaves your device.
 - **Monthly & yearly recap**, **video player** with subtitles/multi-
   language audio, and **DJ Mode** — see the sections below.
 
@@ -85,14 +95,22 @@ and "Demon's Den" briefs — audio-reactive, not just decorative:
   drifting smoke curling up behind it), or **Off** to turn the drip layer
   off entirely. Same geometry and continuous-roll animation either way —
   only the substance (and, for Chemical, the smoke) changes.
-- **Selectable Rage backgrounds** (Settings → 🔥 Rage Background): four
-  full-screen images you can pick between, visible **only** while Rage
-  Mode is on — two Chernobyl-style atomic wastelands and two lava/hell
-  caverns. When one is selected, the canvas washes translucent instead
-  of drawing its own opaque den floor, so the chosen image shows through
-  underneath — with the drips, embers, and everything else in this list
-  layered on top of it exactly as before. Picking "Den (default)" goes
-  back to the fully canvas-drawn Demon's Den scene.
+- **Selectable background image** (Settings → 🖼 Background Image): four
+  full-screen images you can pick between — two Chernobyl-style atomic
+  wastelands and two lava/hell caverns — plus an **Upload Photo** tile
+  that opens your device's file picker so you can use your own image
+  instead. Shows in every mode — Light, Dark, and Rage — not just while
+  Rage Mode is on. While Rage Mode is on, picking an image also makes the
+  ember/eyes canvas wash translucent instead of drawing its own opaque
+  den floor, so the image shows through underneath with the
+  drips/embers/eyes layered on top exactly as before; in Light or Dark
+  mode the image simply replaces the normal animated theme background.
+  Picking "None (default)" goes back to the built-in Demon's Den scene in
+  Rage Mode, or the normal animated theme background in Light/Dark mode.
+  An uploaded photo is stored on-device (IndexedDB) so it's still there
+  next time you open the app, shows up as its own "My Photo" tile you can
+  reselect or remove (✕), and re-uploading replaces it. Capped at 8MB per
+  photo; nothing is ever uploaded anywhere off your device.
 - **Screen-impact shake + flash burst** on real bass drops/onsets.
 - **Crowd-chant flavor text** replacing the sidebar's usual line
   ("BASS INCOMING", "MOSH PIT ACTIVE", etc.) while active.
@@ -139,5 +157,6 @@ an automatic English preference and an AUD picker.
 
 ## Still simplified
 
-The lyrics view and ID3-embedded album art (this still uses generated
-art) aren't in this pass.
+The lyrics view and automatic ID3-embedded album art extraction aren't
+in this pass — songs still default to generated art unless you manually
+upload a photo per-song (see "Custom album art per song" above).
