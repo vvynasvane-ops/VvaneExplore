@@ -1609,6 +1609,7 @@ const GlobeTitle = (function () {
    --------------------------------------------------------------------- */
 global.VV = {
   idbGet, idbSet, idbDelete, idbGetAll, idbGetAllKeys, idbGetAllEntries, idbPut,
+  openDB,
   FONTS, applyFont,
   fsApiSupported, verifyPermission, pickDirectory, getStoredHandle, walkDirectory, AUDIO_EXT,
   ThemeEngine, PixieDust, BookTransition, GlobeTitle,
