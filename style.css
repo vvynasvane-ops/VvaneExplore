@@ -5,7 +5,7 @@
      overridden live by the 8-way font picker (Settings → Fonts). */
   --font-user: 'Courier New', ui-monospace, 'JetBrains Mono', monospace;
   --font-user-weight: 400;
-  --bg-primary: #000000;
+  --bg-primary: #050505;
   --bg-secondary: #050505;
   --bg-card: #0B0B0B;
   --bg-card2: #121212;
@@ -18,7 +18,7 @@
   --accent3: #8B9CA8;
   --accent3-dim: rgba(139,156,168,0.2);
 
-  --text-primary: #B8935A;
+  --text-primary: #F5E6C8;
   --text-secondary: #B8935A;
   --text-muted: #5C4A30;
 
