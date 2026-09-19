@@ -93,6 +93,10 @@ body {
 /* ---------- Book transition (storybook double-door open) ---------- */
 #bookTransition {
   position: fixed; inset: 0; z-index: 70; display: none; perspective: 1400px;
+  /* Purely decorative: without this the overlay swallowed EVERY tap on the
+     whole screen for ~0.7s after each track started — including a tap on
+     any song's ⋮ button. */
+  pointer-events: none;
 }
 #bookTransition .leaf {
   position: absolute; top: 0; bottom: 0; width: 50%; background: linear-gradient(90deg, #3A230F, #6B4525, #3A230F);
@@ -216,6 +220,27 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px;
 }
 
+/* ---------- Universal tap feedback — "literally clicking anything" gets
+   a fast, DJ-crossfader-style thump so every interaction feels alive,
+   not just the ones with their own dedicated animation below.
+   Scoped to LEAF controls only (real buttons/icons) — NOT to container
+   rows/cards like .song-row, .playlist-card, .folder-card. Those contain
+   their own nested buttons, and :active bubbles to ancestors in CSS, so
+   applying a transform to both at once shifts the nested button's live
+   position during the press/release — on release the browser's hit-test
+   can land back on the (now-shifted) row instead of the button, firing
+   the row's "play this song" handler instead of the button's action.
+   That was the cause of the ⋮ song-actions button sometimes playing the
+   row's song instead of opening the sheet. ---------- */
+button, .nav-item, .tabbar button,
+.icon-btn, .row-check, .external-card-head .name, select {
+  transition: transform .14s cubic-bezier(.3,1,.4,1), filter .14s ease;
+}
+button:active, .nav-item:active, .tabbar button:active,
+.icon-btn:active, .row-check:active {
+  transform: scale(.94); filter: brightness(1.12);
+}
+
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--divider); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -325,7 +350,51 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 .content-scroll {
   flex: 1; overflow-y: auto; padding: 4px 22px calc(var(--player-h) + 24px);
   background: rgba(0, 0, 0, var(--songlist-overlay-a, 0.37));
+  /* The mini-player floats over the bottom of this scroller. Without
+     scroll-padding, tabbing to (or programmatically scrolling to) a song's
+     ⋮ button near the bottom parks it UNDER the mini-player where it can't
+     be clicked. */
+  scroll-padding-bottom: calc(var(--player-h) + 16px);
+  scroll-padding-top: 8px;
 }
+
+/* ---------------------------------------------------------------------
+   DJ-set view transitions — every navigateTo() call (nav items, tabbar,
+   playlist/folder cards, back buttons — see pickViewTransition/
+   playViewTransition in app.js) plays one of three mixer moves instead
+   of a hard cut, borrowed straight from the DJ playbook:
+     • dj-swap     — lateral moves between top-level tabs (Library ↔
+                     Playlists ↔ Folders ↔ Favorites ↔ Recent ↔
+                     External) → a quick EQ-kill crossfade: brightness/
+                     saturation punch settling to normal, like the bass
+                     swap landing on the downbeat.
+     • dj-drop     — going deeper (into a folder or a playlist) → a
+                     filter-sweep build (blur + desaturate) releasing
+                     into a hard, full-color drop.
+     • dj-spinback — coming back out → a vinyl brake: a quick reverse
+                     rotation that decelerates back to rest.
+   All three are neutralized by the prefers-reduced-motion rule above.
+   --------------------------------------------------------------------- */
+@keyframes djBassSwap {
+  0%   { opacity: 0; filter: brightness(1.55) saturate(1.5); transform: scale(.985); }
+  55%  { opacity: 1; filter: brightness(1.12) saturate(1.15); transform: scale(1.006); }
+  100% { opacity: 1; filter: brightness(1) saturate(1); transform: scale(1); }
+}
+.content-scroll.dj-swap { animation: djBassSwap .3s cubic-bezier(.2,.8,.3,1) both; }
+
+@keyframes djFilterDrop {
+  0%   { opacity: 0; filter: blur(7px) grayscale(1) brightness(.78); transform: scale(1.035); }
+  60%  { opacity: 1; filter: blur(2px) grayscale(.25) brightness(1.08); transform: scale(1.012); }
+  100% { opacity: 1; filter: blur(0) grayscale(0) brightness(1); transform: scale(1); }
+}
+.content-scroll.dj-drop { animation: djFilterDrop .38s cubic-bezier(.16,.9,.25,1) both; }
+
+@keyframes djSpinback {
+  0%   { opacity: 0; transform: rotate(-5deg) scale(.975); filter: brightness(.78); }
+  50%  { opacity: 1; transform: rotate(1.5deg) scale(1.008); filter: brightness(1.1); }
+  100% { opacity: 1; transform: rotate(0deg) scale(1); filter: brightness(1); }
+}
+.content-scroll.dj-spinback { animation: djSpinback .34s cubic-bezier(.22,1.05,.36,1) both; transform-origin: 50% 0%; }
 
 /* ---------- Connecting / scanning overlay (hourglass + status) ---------- */
 .connecting-card {
@@ -487,7 +556,6 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   font-size: 13.5px; padding: 12px 22px; border-radius: 999px; width: 100%; margin-top: 12px; transition: all .2s;
 }
 .btn-secondary:hover { border-color: var(--accent-dark); color: var(--accent); background: var(--accent-dim); }
-.btn-primary:hover { border-color: var(--accent-dark); color: var(--accent); background: var(--accent-dim); }
 
 /* ---------- Song rows / grid ---------- */
 .section-label {
@@ -508,14 +576,42 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 .song-row.playing .title { color: var(--accent); }
 .song-row .sub { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .song-row .dur { font-size: 12px; color: var(--text-muted); flex: none; font-variant-numeric: tabular-nums; }
-.song-row .row-actions { display: flex; align-items: center; gap: 5px; flex: none; }
-.song-row .fav-btn svg, .song-row .more-btn svg, .song-row .queue-btn svg { width: 17px; height: 17px; }
-.song-row .fav-btn, .song-row .more-btn, .song-row .queue-btn {
-  padding: 6px; border-radius: 50%; color: var(--text-secondary);
+.song-row .row-actions { display: flex; align-items: center; flex: none; }
+/* Single kebab per row, sized to the actual ~44px recommended minimum
+   touch target (Apple HIG / Material) instead of three ~29px icons
+   competing with the row's own full-width play target — see the comment
+   on the SONG ACTIONS SHEET in index.html for why this replaced the old
+   fav/queue/more icon row. */
+.song-row .row-menu-btn {
+  position: relative;
+  width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; color: var(--text-secondary);
   background: var(--ripple); border: 1px solid var(--divider);
 }
-.song-row .fav-btn.active { color: var(--accent2); background: var(--accent2-dim); border-color: rgba(178,34,34,.4); }
-.song-row .fav-btn:hover, .song-row .more-btn:hover, .song-row .queue-btn:hover { color: var(--accent); background: var(--accent-dim); border-color: var(--accent-dark); }
+.song-row .row-menu-btn svg { width: 18px; height: 18px; }
+.song-row .row-menu-btn:hover, .song-row .row-menu-btn:active { color: var(--accent); background: var(--accent-dim); border-color: var(--accent-dark); }
+.song-row .row-menu-btn .fav-dot {
+  position: absolute; top: -1px; right: -1px; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--accent2); border: 1.5px solid var(--bg, #14110c);
+}
+@media (max-width: 380px) {
+  .song-row .row-menu-btn { width: 36px; height: 36px; }
+}
+
+/* ---------- Song actions sheet (⋮ menu) ---------- */
+.row-actions-sheet-title { min-width: 0; }
+.row-actions-sheet-title .t { font-family: var(--font-display); font-size: 14px; letter-spacing: .04em; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-actions-sheet-title .s { font-size: 12px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-action-item {
+  display: flex; align-items: center; gap: 14px; width: 100%;
+  min-height: 48px; padding: 0 12px; border-radius: var(--radius-s);
+  color: var(--text); text-align: left; cursor: pointer;
+}
+.row-action-item:hover, .row-action-item:active { background: var(--ripple); }
+.row-action-item svg { width: 20px; height: 20px; flex: none; color: var(--accent); }
+.row-action-item.active svg { color: var(--accent2); }
+.row-action-item.danger { color: var(--accent2); }
+.row-action-item.danger svg { color: var(--accent2); }
 .song-row .index { width: 20px; flex: none; text-align: center; font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 
 /* ---------- Multi-select mode (playlists / favorites / recently played) ---------- */
@@ -562,8 +658,14 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   border-radius: var(--radius-s); padding: 11px 13px; font-size: 13.5px; outline: none; transition: border-color .15s;
 }
 .external-add-row input[type=text]:focus { border-color: var(--accent-dark); }
+.external-add-row select {
+  flex: none; background: var(--bg-card); border: 1px solid var(--divider); color: var(--text-primary);
+  border-radius: var(--radius-s); padding: 11px 10px; font-size: 12.5px; outline: none; max-width: 168px; cursor: pointer;
+}
+.external-add-row select:focus { border-color: var(--accent-dark); }
 .external-add-row button { flex: none; padding: 11px 18px; }
 .external-hint { font-size: 11.5px; color: var(--text-muted); line-height: 1.5; margin: 0 0 18px; max-width: 640px; }
+.external-hint code { background: var(--bg-card2); border-radius: 4px; padding: 1px 5px; font-size: 11px; }
 .external-card {
   background: var(--bg-card); border: 1px solid var(--divider); border-radius: var(--radius-m);
   padding: 14px; margin-bottom: 16px;
@@ -574,6 +676,14 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; color: var(--accent);
   background: var(--accent-dim); border: 1px solid var(--accent-dark); border-radius: 999px; padding: 2px 8px; margin-left: 8px; vertical-align: middle;
 }
+.ext-badge-youtube { color: #ff5252; background: rgba(255,82,82,.12); border-color: rgba(255,82,82,.35); }
+.ext-badge-spotify { color: #1ed760; background: rgba(30,215,96,.12); border-color: rgba(30,215,96,.35); }
+.ext-badge-soundcloud { color: #ff8a00; background: rgba(255,138,0,.12); border-color: rgba(255,138,0,.35); }
+.ext-badge-applemusic { color: #fc3c66; background: rgba(252,60,102,.12); border-color: rgba(252,60,102,.35); }
+.ext-badge-deezer { color: #a238ff; background: rgba(162,56,255,.12); border-color: rgba(162,56,255,.35); }
+.ext-badge-mixcloud { color: #52aad8; background: rgba(82,170,216,.12); border-color: rgba(82,170,216,.35); }
+.ext-badge-stream { color: #22c98f; background: rgba(34,201,143,.12); border-color: rgba(34,201,143,.35); }
+.ext-badge-custom { color: var(--accent); background: var(--accent-dim); border-color: var(--accent-dark); }
 .ext-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 .ext-note {
   font-size: 11px; color: var(--text-muted); background: var(--accent2-dim); border: 1px solid rgba(178,34,34,.3);
@@ -581,6 +691,8 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 }
 .external-embed-wrap { position: relative; width: 100%; padding-top: 56.25%; border-radius: var(--radius-s); overflow: hidden; background: #000; }
 .external-embed-wrap iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.external-embed-wrap.fixed { padding-top: 0; background: transparent; }
+.external-embed-wrap.fixed iframe { position: static; }
 
 .empty-state {
   display: flex; flex-direction: column; align-items: center; text-align: center;
@@ -673,6 +785,38 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 .player-scroll { flex: 1; overflow-y: auto; display: flex; flex-direction: column; align-items: center; padding: 10px 28px calc(24px + var(--safe-bottom)); }
 .player-art-wrap { width: min(300px, 62vw); aspect-ratio: 1; margin: 10px 0 26px; border-radius: 18px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.5); flex: none; position: relative; }
 .player-art-wrap .art { width: 100%; height: 100%; }
+
+/* ---------------------------------------------------------------------
+   Play / Pause transitions — see triggerLoopTighten() / triggerEchoOut()
+   in app.js, wired into togglePlay(). Hitting Play "tightens" the
+   artwork like a loop building into a drop; hitting Pause leaves an
+   echo/delay tail — a few fading, growing ghost copies — behind, the
+   same way an echo-out lets a track dissolve rather than cut dead.
+   --------------------------------------------------------------------- */
+@keyframes djLoopTighten {
+  0%   { transform: scale(1); filter: brightness(1) saturate(1); }
+  20%  { transform: scale(.92); filter: brightness(1.22) saturate(1.3); }
+  45%  { transform: scale(1.07); filter: brightness(1.4) saturate(1.4); }
+  70%  { transform: scale(.97); filter: brightness(1.08) saturate(1.05); }
+  100% { transform: scale(1); filter: brightness(1) saturate(1); }
+}
+.dj-loop-tighten { animation: djLoopTighten .55s cubic-bezier(.3,1.3,.4,1) both; }
+
+@keyframes djEchoFade {
+  0%   { opacity: .5; transform: scale(1); filter: blur(0); }
+  100% { opacity: 0; transform: scale(1.22); filter: blur(3px); }
+}
+.dj-echo-ghost { animation: djEchoFade .5s ease-out both; border-radius: inherit; }
+
+/* Little "pop" synced with the play/pause icon's shape-shift above,
+   independent of the universal :active press so the two don't fight. */
+@keyframes djIconMorphPulse {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(1.22); }
+  100% { transform: scale(1); }
+}
+.dj-icon-morph { animation: djIconMorphPulse .32s cubic-bezier(.3,1.4,.4,1) both; }
+
 /* Edit / reset album-art buttons overlaid on the full-player artwork */
 .art-edit-btn, .art-reset-btn {
   position: absolute; bottom: 10px; right: 10px; width: 36px; height: 36px; border-radius: 999px;
@@ -724,14 +868,50 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 .sheet {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 46; max-height: 68vh;
   background: var(--bg-card); border-radius: 20px 20px 0 0; border-top: 1px solid var(--divider);
-  transform: translateY(100%); transition: transform .3s cubic-bezier(.2,.8,.2,1);
+  transform: translateY(100%);
+  /* visibility flips only AFTER the slide-out finishes (0s duration, .3s
+     delay) so the close animation is still visible. */
+  transition: transform .3s cubic-bezier(.2,.8,.2,1), visibility 0s linear .3s;
   display: flex; flex-direction: column; padding-bottom: var(--safe-bottom);
+  /* A closed sheet must be completely inert. On tablet/desktop widths the
+     closed sheet is only faded out (opacity: 0) and parked over the
+     bottom-right of the song list — with no pointer-events rule it kept
+     catching clicks there, so the ⋮ button of any song scrolled into that
+     corner (typically the LAST songs of a list) silently did nothing.
+     visibility:hidden also removes its buttons from the tab order. */
+  pointer-events: none; visibility: hidden;
 }
-.sheet.open { transform: translateY(0); }
+.sheet.open { transform: translateY(0); pointer-events: auto; visibility: visible; transition: transform .3s cubic-bezier(.2,.8,.2,1), visibility 0s; }
 .sheet-handle { width: 36px; height: 4px; background: var(--divider); border-radius: 4px; margin: 10px auto 4px; }
 .sheet-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 18px 10px; }
 .sheet-head h2 { font-family: var(--font-display); font-size: 14px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0; }
 .sheet-body { overflow-y: auto; padding: 0 10px 14px; }
+
+/* On phones the sheet is the standard edge-to-edge slide-up drawer above.
+   From tablet width up, the app has a permanent sidebar and looks like a
+   real desktop app — a full-bleed mobile drawer glued to the viewport
+   edges looks out of place there, so instead it becomes a compact,
+   fully-rounded floating panel that pops up from where the ⋮/queue
+   button actually lives (bottom-right, above the mini player), with a
+   soft scale+fade instead of a slide — closer to how a desktop app's
+   context menu or popover behaves than a phone's bottom sheet. */
+@media (min-width: 900px) {
+  .sheet {
+    left: auto; right: 24px; bottom: calc(var(--player-h) + 20px);
+    width: min(380px, calc(100vw - 48px)); max-height: min(70vh, 560px);
+    border-radius: var(--radius-l, 18px); border: 1px solid var(--divider);
+    box-shadow: 0 18px 48px rgba(0,0,0,.4);
+    transform: translateY(10px) scale(.97); opacity: 0;
+    transform-origin: bottom right;
+    transition: transform .22s cubic-bezier(.2,.8,.2,1), opacity .18s ease, visibility 0s linear .22s;
+    padding-bottom: 4px;
+  }
+  .sheet.open { transform: translateY(0) scale(1); opacity: 1; transition: transform .22s cubic-bezier(.2,.8,.2,1), opacity .18s ease, visibility 0s; }
+  .sheet-handle { display: none; }
+}
+@media (min-width: 900px) and (max-width: 1023px) {
+  .sheet { right: 16px; width: min(340px, calc(100vw - 32px)); }
+}
 
 /* ---------- Modal (playlists / add-to-playlist / iOS instructions) ---------- */
 .modal-overlay { position: fixed; inset: 0; background: var(--overlay); z-index: 60; display: flex; align-items: center; justify-content: center; padding: 20px; opacity: 0; pointer-events: none; transition: opacity .2s; }
@@ -804,7 +984,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   }
   .tabbar button.active { color: var(--accent); }
   .tabbar svg { width: 19px; height: 19px; }
-  .content-scroll { padding-bottom: calc(56px + var(--player-h) + var(--safe-bottom) + 20px); }
+  .content-scroll { padding-bottom: calc(56px + var(--player-h) + var(--safe-bottom) + 20px); scroll-padding-bottom: calc(56px + var(--player-h) + var(--safe-bottom) + 12px); }
   .topbar h1 { display: none; }
   .topbar { padding: calc(12px + var(--safe-top)) 14px 12px; gap: 8px; }
   .content-scroll { padding-left: 14px; padding-right: 14px; }
@@ -1011,4 +1191,75 @@ html.rage-active #heartTitleCanvas { display: block; }
 @media (max-width: 380px) {
   .tc-card { width: 104px; height: 154px; }
   .tc-track { height: 190px; }
+}
+
+/* =====================================================================
+   VOLUME CONTROL + KEYBOARD SHORTCUTS
+   Shared by the audio player (index.html) and video player (video.html).
+   ===================================================================== */
+
+/* Range slider whose filled portion tracks --vol-pct (set from JS) */
+.vol-slider {
+  -webkit-appearance: none; appearance: none; height: 4px; border-radius: 4px; outline: none; cursor: pointer;
+  background: linear-gradient(to right, var(--accent) var(--vol-pct, 100%), var(--divider) var(--vol-pct, 100%));
+  min-width: 0;
+}
+.vol-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; box-shadow: 0 0 6px var(--accent-dim); border: none;
+}
+.vol-slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: none; cursor: pointer; }
+.vol-slider::-moz-range-track { background: transparent; height: 4px; }
+.vol-slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.vol-mute-btn {
+  width: 36px; height: 36px; flex: none; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; color: var(--text-secondary); background: var(--ripple); transition: color .2s, background .2s;
+}
+.vol-mute-btn:hover { color: var(--accent); background: var(--accent-dim); }
+.vol-mute-btn.muted { color: var(--accent2); background: var(--accent2-dim); }
+.vol-mute-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.vol-value { font-size: 11.5px; color: var(--text-muted); width: 38px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
+.no-volume-slider .vol-slider, .no-volume-slider .vol-value { display: none; }
+
+/* Audio — full player row */
+.player-volume { display: flex; align-items: center; gap: 12px; width: 100%; max-width: 460px; margin-top: 22px; }
+.player-volume .vol-slider { flex: 1; }
+
+/* Audio — mini player (desktop/tablet only; phones use hardware buttons) */
+.mini-volume { display: flex; align-items: center; gap: 6px; flex: none; margin-right: 8px; cursor: default; }
+.mini-volume .vol-mute-btn { width: 32px; height: 32px; }
+.mini-volume .vol-slider { width: 92px; }
+@media (max-width: 899px) { .mini-volume { display: none; } }
+
+/* Video — volume row + on-screen display */
+.vp-volume-row { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 0 18px 14px; max-width: 360px; margin: 0 auto; }
+.vp-volume-row .vol-slider { flex: 1; }
+.vp-stage { position: relative; }
+.vp-stage:fullscreen { background: #000; }
+.vp-stage:fullscreen video { max-height: 100vh; height: 100vh; }
+.vp-stage:-webkit-full-screen { background: #000; }
+.vp-stage:-webkit-full-screen video { max-height: 100vh; height: 100vh; }
+.vp-osd {
+  position: absolute; top: 14px; right: 14px; z-index: 3; display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; border-radius: 999px; background: rgba(0,0,0,.72); color: #fff; font-size: 13px;
+  font-variant-numeric: tabular-nums; pointer-events: none; opacity: 0; transform: translateY(-4px);
+  transition: opacity .18s, transform .18s;
+}
+.vp-osd.show { opacity: 1; transform: none; }
+.vp-osd svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.vp-osd .osd-bar { width: 80px; height: 4px; border-radius: 4px; background: rgba(255,255,255,.25); overflow: hidden; }
+.vp-osd .osd-bar > i { display: block; height: 100%; background: var(--accent); }
+
+/* Keyboard shortcut notice (Settings panel / video Shortcuts panel) */
+.shortcut-list { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 2px; border-bottom: 1px solid var(--divider); }
+.shortcut-row:last-child { border-bottom: none; }
+.shortcut-keys { display: flex; align-items: center; gap: 4px; flex: none; }
+.shortcut-plus { font-size: 10px; color: var(--text-muted); }
+.shortcut-label { font-size: 12.5px; color: var(--text-secondary); text-align: right; }
+.shortcut-note { font-size: 11px; color: var(--text-muted); margin-top: 8px; line-height: 1.5; }
+kbd {
+  display: inline-block; min-width: 24px; padding: 3px 7px; border-radius: 6px; text-align: center;
+  font-family: inherit; font-size: 11.5px; font-weight: 600; line-height: 1.2; color: var(--accent);
+  background: var(--bg-secondary); border: 1px solid var(--divider); border-bottom-width: 2px;
 }
