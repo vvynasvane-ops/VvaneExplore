@@ -189,27 +189,41 @@ function ensureAudioContext() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   masterGain = audioCtx.createGain();
   masterGain.gain.value = 1;
-  masterGain.connect(audioCtx.destination);
+  // The equalizer sits between the crossfaded mix and the speakers, so it
+  // shapes whatever's actually playing regardless of which deck (or both)
+  // is live — same shared settings as the music/video player. Wired
+  // eagerly (not lazily): unlike those pages, DJ mode already routes both
+  // decks through this context from the moment a deck loads, so the
+  // signal has nowhere else to go until this connects it through.
+  if (window.VaneEQ) {
+    window.VaneEQ.attachToNode(audioCtx, masterGain, audioCtx.destination, {
+      isPlaying: () => state.deckA.playing || state.deckB.playing,
+    });
+    window.VaneEQ.ensureGraph();
+  } else {
+    masterGain.connect(audioCtx.destination);
+  }
   return audioCtx;
 }
 
 const $ = (s) => document.querySelector(s);
 const els = {
   grant: $("#djGrant"), grantBtn: $("#djGrantBtn"), app: $("#djApp"), status: $("#djStatus"),
-  visualBtn: $("#djVisualBtn"), settingsBtn: $("#djSettingsBtn"),
+  visualBtn: $("#djVisualBtn"), settingsBtn: $("#djSettingsBtn"), eqBtn: $("#djEqBtn"),
   deckAArt: $("#deckAArt"), deckATitle: $("#deckATitle"), deckAArtist: $("#deckAArtist"), deckACount: $("#deckACount"),
   deckAPitch: $("#deckAPitch"), deckASelect: $("#deckASelect"), deckAPlay: $("#deckAPlay"), deckACue: $("#deckACue"),
   deckBArt: $("#deckBArt"), deckBTitle: $("#deckBTitle"), deckBArtist: $("#deckBArtist"), deckBCount: $("#deckBCount"),
   deckBPitch: $("#deckBPitch"), deckBSelect: $("#deckBSelect"), deckBPlay: $("#deckBPlay"), deckBCue: $("#deckBCue"),
   crossfader: $("#crossfader"), bassSlider: $("#bassSlider"), bassLabel: $("#bassLabel"),
   btnAutoMix: $("#btnAutoMix"), btnBeatSync: $("#btnBeatSync"), btnShoutout: $("#btnShoutout"),
-  addQueueBtn: $("#djAddQueueBtn"), queueList: $("#queueList"),
+  addQueueBtn: $("#djAddQueueBtn"), queueList: $("#queueList"), queueListWrap: $("#queueListWrap"),
   shoutoutText: $("#shoutoutText"), toast: $("#toast"),
   pickerOverlay: $("#pickerOverlay"), pickerTitle: $("#pickerTitle"), pickerSearch: $("#pickerSearch"), pickerList: $("#pickerList"), pickerCloseBtn: $("#pickerCloseBtn"),
   settingsOverlay: $("#djSettingsOverlay"), settingsCloseBtn: $("#djSettingsCloseBtn"),
   optVisualTheme: $("#optVisualTheme"), visualThemeName: $("#visualThemeName"), optCrossfade: $("#optCrossfade"), crossfadeDurLabel: $("#crossfadeDurLabel"),
   optBassPreset: $("#optBassPreset"), optResetCounts: $("#optResetCounts"), optClearQueue: $("#optClearQueue"), optAbout: $("#optAbout"),
   aboutOverlay: $("#aboutOverlay"), aboutCloseBtn: $("#aboutCloseBtn"),
+  scrollTopBtn: $("#scrollTopBtn"), scrollTopFill: $("#scrollTopFill"),
 };
 
 function toast(msg) { els.toast.textContent = msg; els.toast.classList.add("show"); clearTimeout(toast._t); toast._t = setTimeout(() => els.toast.classList.remove("show"), 2200); }
@@ -606,7 +620,7 @@ setInterval(() => {
    Queue
    --------------------------------------------------------------------- */
 function renderQueue() {
-  if (!state.djQueue.length) { els.queueList.innerHTML = '<div class="queue-empty">Queue is empty — add tracks to auto-load when a deck finishes.</div>'; return; }
+  if (!state.djQueue.length) { els.queueList.innerHTML = '<div class="queue-empty">Queue is empty — add tracks to auto-load when a deck finishes.</div>'; els.queueList._miniScrollUpdate && els.queueList._miniScrollUpdate(); return; }
   els.queueList.innerHTML = state.djQueue.map((s, i) => `
     <div class="queue-row" data-idx="${i}">
       <span class="t"><span class="q-arrow">▶</span><span class="marquee-mask"><span class="marquee-track">${escapeHtml(s.title)}</span></span></span>
@@ -614,6 +628,7 @@ function renderQueue() {
       <button class="rm" data-remove="${i}">✕</button>
     </div>`).join("");
   marqueeAll(els.queueList);
+  els.queueList._miniScrollUpdate && els.queueList._miniScrollUpdate();
 }
 els.queueList.addEventListener("click", (e) => {
   const rmBtn = e.target.closest("[data-remove]");
@@ -653,6 +668,8 @@ function renderPickerList(q) {
     ? list.map(s => `<div class="dj-modal-row" data-id="${s.id}"><span class="t"><span class="marquee-track">${escapeHtml(s.title)}</span></span><span class="a">${escapeHtml(s.artist)}</span></div>`).join("")
     : `<div class="dj-modal-row" style="color:#666;">No matches.</div>`;
   marqueeAll(els.pickerList);
+  const modal = els.pickerList.closest(".dj-modal");
+  modal && modal._miniScrollUpdate && modal._miniScrollUpdate();
 }
 els.pickerSearch.addEventListener("input", () => renderPickerList(els.pickerSearch.value));
 els.pickerList.addEventListener("click", (e) => {
@@ -678,6 +695,36 @@ function cycleVisualTheme() {
   els.visualThemeName.textContent = THEMES[next].name;
 }
 els.visualBtn.addEventListener("click", cycleVisualTheme);
+
+/* ---------------------------------------------------------------------
+   Equalizer — same shared panel and saved settings as the music/video
+   player, inserted after the crossfader (see ensureAudioContext above).
+   --------------------------------------------------------------------- */
+if (window.VaneEQ && els.eqBtn) {
+  window.VaneEQ.subscribe((snap) => {
+    els.eqBtn.classList.toggle("eq-on", snap.engaged);
+    els.eqBtn.title = (snap.engaged ? "Equalizer — on (E)" : "Equalizer (E)");
+  });
+  els.eqBtn.addEventListener("click", () => window.VaneEQ.toggle(els.eqBtn));
+}
+
+/* "E" for the equalizer — same key as the music/video player, off while
+   typing or with a modal/sheet already open on top of the booth. */
+function isTypingTarget(t) {
+  if (!(t instanceof window.Element)) return false;
+  if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+  if (t.tagName !== "INPUT") return false;
+  return !["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"].includes((t.type || "").toLowerCase());
+}
+window.addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.shiftKey || e.repeat) return;
+  if (isTypingTarget(e.target)) return;
+  if (e.key.toLowerCase() !== "e") return;
+  const blockingOverlays = [els.pickerOverlay, els.settingsOverlay, els.aboutOverlay];
+  if (blockingOverlays.some(el => el && el.classList.contains("open"))) return;
+  e.preventDefault();
+  window.VaneEQ && window.VaneEQ.toggle(els.eqBtn);
+});
 
 /* ---------------------------------------------------------------------
    DJ Settings modal
@@ -722,6 +769,83 @@ els.aboutCloseBtn.addEventListener("click", () => els.aboutOverlay.classList.rem
 els.aboutOverlay.addEventListener("click", (e) => { if (e.target === els.aboutOverlay) els.aboutOverlay.classList.remove("open"); });
 
 /* ---------------------------------------------------------------------
+   Scroll-to-top — the one piece of the "scrolling mark" that's reliably
+   visible on every device, not just desktop browsers that honor a
+   styled scrollbar. The ring fills as the page scrolls down (0 → full
+   circumference), so it doubles as a lightweight scroll-position cue
+   even before you tap it.
+   --------------------------------------------------------------------- */
+const SCROLL_RING_CIRC = 2 * Math.PI * 19; // r=19 from the SVG circle
+let scrollTicking = false;
+function updateScrollTop() {
+  scrollTicking = false;
+  const doc = document.documentElement;
+  const max = doc.scrollHeight - doc.clientHeight;
+  const y = window.scrollY || doc.scrollTop || 0;
+  const pct = max > 0 ? Math.min(1, y / max) : 0;
+  els.scrollTopBtn.classList.toggle("show", y > 240);
+  els.scrollTopFill.style.strokeDashoffset = (SCROLL_RING_CIRC * (1 - pct)).toFixed(1);
+}
+window.addEventListener("scroll", () => { if (!scrollTicking) { scrollTicking = true; requestAnimationFrame(updateScrollTop); } }, { passive: true });
+window.addEventListener("resize", () => requestAnimationFrame(updateScrollTop));
+els.scrollTopBtn.addEventListener("click", () => window.scrollTo({ top: 0, behavior: "smooth" }));
+updateScrollTop();
+
+/* ---------------------------------------------------------------------
+   Same marker, generalized to any OTHER panel that can scroll on its
+   own — the Battle Queue list and each modal sheet. `mountEl` is where
+   the button physically lives in the DOM; it defaults to `scrollEl`
+   itself but can be a stable wrapper for panels whose innerHTML gets
+   wholesale replaced on re-render (the queue list), so the marker
+   isn't destroyed along with the old content.
+   --------------------------------------------------------------------- */
+function initMiniScrollTop(scrollEl, mountEl, opts = {}) {
+  if (!scrollEl || scrollEl._miniScrollBtn) return;
+  mountEl = mountEl || scrollEl;
+  const { modifier = "", threshold = 24 } = opts;
+  const R = 12, CIRC = (2 * Math.PI * R).toFixed(1);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "dj-mini-scrolltop" + (modifier ? " " + modifier : "");
+  btn.title = "Haul to the top";
+  btn.setAttribute("aria-label", "Scroll to top");
+  btn.innerHTML = `
+    <svg class="dj-mini-scrolltop-ring" viewBox="0 0 30 30">
+      <circle class="dj-mini-scrolltop-track" cx="15" cy="15" r="${R}"/>
+      <circle class="dj-mini-scrolltop-fill" cx="15" cy="15" r="${R}" style="stroke-dasharray:${CIRC};stroke-dashoffset:${CIRC}"/>
+    </svg>
+    <svg class="dj-mini-scrolltop-arrow" viewBox="0 0 24 24" fill="none" stroke="#E8C468" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 21.5V6.5M8 10.5l4-4 4 4"/>
+    </svg>`;
+  const fill = btn.querySelector(".dj-mini-scrolltop-fill");
+  mountEl.appendChild(btn);
+  scrollEl._miniScrollBtn = btn;
+
+  let ticking = false;
+  function update() {
+    ticking = false;
+    const max = scrollEl.scrollHeight - scrollEl.clientHeight;
+    if (max <= threshold) { btn.classList.remove("show"); return; }
+    const pct = Math.min(1, Math.max(0, scrollEl.scrollTop / max));
+    fill.style.strokeDashoffset = (CIRC * (1 - pct)).toFixed(1);
+    btn.classList.toggle("show", scrollEl.scrollTop > threshold);
+  }
+  scrollEl.addEventListener("scroll", () => { if (!ticking) { ticking = true; requestAnimationFrame(update); } }, { passive: true });
+  btn.addEventListener("click", (e) => { e.stopPropagation(); scrollEl.scrollTo({ top: 0, behavior: "smooth" }); });
+  // scrollEl's own box is height-capped (max-height), so it never
+  // actually resizes when rows are added/removed — only its internal
+  // scrollHeight changes, which ResizeObserver won't catch. Expose
+  // update() so renderQueue()/renderPickerList() can re-check right
+  // after they mutate content, instead of waiting for the next scroll.
+  scrollEl._miniScrollUpdate = update;
+  if (window.ResizeObserver) new ResizeObserver(() => requestAnimationFrame(update)).observe(scrollEl);
+  update();
+}
+
+initMiniScrollTop(els.queueList, els.queueListWrap);
+document.querySelectorAll(".dj-modal").forEach(m => initMiniScrollTop(m, m, { modifier: "dj-mini-scrolltop--modal" }));
+
+/* ---------------------------------------------------------------------
    Boot
    --------------------------------------------------------------------- */
 async function boot() {
@@ -742,6 +866,7 @@ async function boot() {
       const ok = await verifyPermission(handle, true);
       if (ok) { state.usingFSApi = true; await scanHandle(handle); } else toast("Access wasn't granted.");
     };
+    window.VV.watchForSilentReconnect(handle, async () => { state.usingFSApi = true; await scanHandle(handle); });
   }
 }
 boot();
